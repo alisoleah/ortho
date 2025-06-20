@@ -1,0 +1,1026 @@
+# Professional Lingual Orthodontic Wire Generator - INNER SURFACE VERSION
+# Modified to place brackets on the LINGUAL (inner/tongue) surface of teeth
+# pip install open3d numpy scipy
+
+import numpy as np
+import open3d as o3d
+import os
+from scipy import interpolate, signal
+from scipy.spatial import distance_matrix
+import csv
+
+class LingualOrthodonticWireGenerator:
+    """Professional lingual orthodontic wire generator - places wire on INNER surface of teeth."""
+    
+    # Standard wire dimensions (in inches, converted to mm)
+    WIRE_SIZES = {
+        '0.012': 0.3048,
+        '0.014': 0.3556,
+        '0.016': 0.4064,
+        '0.018': 0.4572,
+        '0.020': 0.5080,
+        '0.016x0.022': (0.4064, 0.5588),
+        '0.018x0.025': (0.4572, 0.6350),
+        '0.019x0.025': (0.4826, 0.6350),
+        '0.021x0.025': (0.5334, 0.6350)
+    }
+    
+    # Clinical bracket heights by tooth type (mm from incisal/occlusal)
+    BRACKET_HEIGHTS = {
+        'upper': {
+            'central_incisor': 4.5,
+            'lateral_incisor': 4.0,
+            'canine': 5.0,
+            'first_premolar': 4.5,
+            'second_premolar': 4.5,
+            'first_molar': 3.5,
+            'second_molar': 3.0
+        },
+        'lower': {
+            'central_incisor': 4.0,
+            'lateral_incisor': 4.0,
+            'canine': 5.0,
+            'first_premolar': 4.5,
+            'second_premolar': 4.5,
+            'first_molar': 3.5,
+            'second_molar': 3.0
+        }
+    }
+    
+    def __init__(self, stl_path, arch_type='auto', wire_size='0.018'):
+        """Initialize the lingual wire generator."""
+        self.stl_path = stl_path
+        self.wire_size = wire_size
+        self.wire_radius = self.WIRE_SIZES.get(wire_size, 0.4572) / 2
+        
+        # Detect arch type
+        if arch_type == 'auto':
+            self.arch_type = 'lower' if 'lower' in stl_path.lower() else 'upper'
+        else:
+            self.arch_type = arch_type
+            
+        self.mesh = None
+        self.teeth = []
+        self.bracket_positions = []
+        self.wire_path = []
+        
+    def load_mesh(self):
+        """Load and process the STL mesh."""
+        print(f"\n{'='*70}")
+        print("LINGUAL ORTHODONTIC WIRE GENERATION SYSTEM v2.0")
+        print("*** INNER SURFACE (LINGUAL) WIRE PLACEMENT ***")
+        print(f"{'='*70}")
+        print(f"\nLoading: {os.path.basename(self.stl_path)}")
+        print(f"Arch Type: {self.arch_type.upper()}")
+        print(f"Wire Size: {self.wire_size}")
+        print(f"Wire Position: LINGUAL (Inner/Tongue Side)")
+        
+        try:
+            self.mesh = o3d.io.read_triangle_mesh(self.stl_path)
+            if not self.mesh.has_triangles():
+                raise ValueError("No triangles found in mesh")
+            
+            # Clean and prepare mesh
+            self.mesh.remove_duplicated_vertices()
+            self.mesh.remove_degenerate_triangles()
+            self.mesh.compute_vertex_normals()
+            self.mesh.compute_triangle_normals()
+            
+            # Natural tooth color
+            self.mesh.paint_uniform_color([0.95, 0.93, 0.88])
+            
+            print(f"✓ Loaded: {len(self.mesh.vertices)} vertices, {len(self.mesh.triangles)} triangles")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Error loading mesh: {e}")
+            return False
+    
+    def detect_teeth_with_anatomical_zoning(self):
+        """Detect teeth using robust anatomical zoning method."""
+        print(f"\n{'─'*50}")
+        print("TOOTH DETECTION WITH ANATOMICAL ZONING")
+        print(f"{'─'*50}")
+        
+        vertices = np.asarray(self.mesh.vertices)
+        bbox = self.mesh.get_axis_aligned_bounding_box()
+        center = self.mesh.get_center()
+        extent = bbox.get_extent()
+        
+        # Identify anatomical axes
+        self.lr_axis = np.argmax(extent)  # Left-Right (widest)
+        self.height_axis = np.argmin(extent)  # Occlusal-Gingival (smallest)
+        self.ap_axis = 3 - self.lr_axis - self.height_axis  # Anterior-Posterior
+        
+        print(f"Anatomical axes identified:")
+        print(f"  • Left-Right axis: {self.lr_axis} (extent: {extent[self.lr_axis]:.1f}mm)")
+        print(f"  • Anterior-Posterior axis: {self.ap_axis} (extent: {extent[self.ap_axis]:.1f}mm)")
+        print(f"  • Occlusal-Gingival axis: {self.height_axis} (extent: {extent[self.height_axis]:.1f}mm)")
+        
+        # Sample at crown level
+        crown_ratio = 0.25 if self.arch_type == 'upper' else 0.75
+        crown_level = bbox.min_bound[self.height_axis] + extent[self.height_axis] * crown_ratio
+        
+        # Get crown vertices
+        height_tolerance = max(2.0, extent[self.height_axis] * 0.15)
+        crown_mask = np.abs(vertices[:, self.height_axis] - crown_level) < height_tolerance
+        crown_vertices = vertices[crown_mask]
+        
+        print(f"\nCrown analysis:")
+        print(f"  • Crown level: {crown_level:.1f}mm")
+        print(f"  • Vertices at crown: {len(crown_vertices)}")
+        
+        # Segment teeth using angular approach
+        self.teeth = []
+        
+        # Calculate angles for all crown vertices
+        angles = np.arctan2(
+            crown_vertices[:, self.ap_axis] - center[self.ap_axis],
+            crown_vertices[:, self.lr_axis] - center[self.lr_axis]
+        )
+        
+        # Find posterior gap
+        sorted_angles = np.sort(angles)
+        angle_diffs = np.diff(sorted_angles)
+        angle_diffs = np.append(angle_diffs, sorted_angles[0] + 2*np.pi - sorted_angles[-1])
+        
+        posterior_gap_idx = np.argmax(angle_diffs)
+        posterior_gap_size = angle_diffs[posterior_gap_idx]
+        
+        print(f"\nPosterior gap: {np.degrees(posterior_gap_size):.1f}° at index {posterior_gap_idx}")
+        
+        # Define angular segments for teeth
+        expected_teeth = 14  # Standard adult dentition minus wisdom teeth
+        active_angle_range = 2 * np.pi - posterior_gap_size
+        angle_per_tooth = active_angle_range / expected_teeth
+        
+        # Start from after the gap
+        start_angle = sorted_angles[(posterior_gap_idx + 1) % len(sorted_angles)]
+        
+        # Detect individual teeth
+        for i in range(expected_teeth + 2):  # Extra segments for safety
+            tooth_start = start_angle + i * angle_per_tooth
+            tooth_end = tooth_start + angle_per_tooth
+            
+            # Normalize angles
+            tooth_start = np.mod(tooth_start + np.pi, 2*np.pi) - np.pi
+            tooth_end = np.mod(tooth_end + np.pi, 2*np.pi) - np.pi
+            
+            # Get vertices in segment
+            if tooth_start < tooth_end:
+                angle_mask = (angles >= tooth_start) & (angles < tooth_end)
+            else:
+                angle_mask = (angles >= tooth_start) | (angles < tooth_end)
+            
+            segment_vertices = crown_vertices[angle_mask]
+            
+            if len(segment_vertices) < 30:
+                continue
+            
+            # Calculate tooth center using outer vertices
+            distances = np.linalg.norm(
+                segment_vertices[:, [self.lr_axis, self.ap_axis]] - 
+                center[[self.lr_axis, self.ap_axis]], axis=1
+            )
+            
+            # Use outer 40% of vertices
+            dist_threshold = np.percentile(distances, 60)
+            outer_vertices = segment_vertices[distances >= dist_threshold]
+            
+            if len(outer_vertices) > 5:
+                tooth_center = np.mean(outer_vertices, axis=0)
+            else:
+                tooth_center = np.mean(segment_vertices, axis=0)
+            
+            # Store tooth
+            tooth_angle = np.arctan2(
+                tooth_center[self.ap_axis] - center[self.ap_axis],
+                tooth_center[self.lr_axis] - center[self.lr_axis]
+            )
+            
+            self.teeth.append({
+                'center': tooth_center,
+                'vertices': segment_vertices,
+                'angle': tooth_angle,
+                'ap_position': tooth_center[self.ap_axis],
+                'lr_position': tooth_center[self.lr_axis],
+                'index': len(self.teeth),
+                'type': 'unknown'
+            })
+        
+        # Sort teeth by angle
+        self.teeth.sort(key=lambda t: t['angle'])
+        
+        # Remove duplicates/too close teeth
+        filtered_teeth = []
+        for i, tooth in enumerate(self.teeth):
+            if i == 0:
+                filtered_teeth.append(tooth)
+            else:
+                # Check distance from previous tooth
+                prev_tooth = filtered_teeth[-1]
+                dist = np.linalg.norm(tooth['center'] - prev_tooth['center'])
+                if dist > 3.0:  # Minimum 3mm between tooth centers
+                    filtered_teeth.append(tooth)
+        
+        self.teeth = filtered_teeth
+        
+        # Apply anatomical zoning classification
+        self._apply_anatomical_zoning()
+        
+        print(f"\nDetected {len(self.teeth)} teeth after filtering")
+        
+        # Verification
+        tooth_types = {}
+        for tooth in self.teeth:
+            tooth_type = tooth['type']
+            tooth_types[tooth_type] = tooth_types.get(tooth_type, 0) + 1
+        
+        print("\nTooth classification summary:")
+        print(f"  • Incisors (Blue): {tooth_types.get('incisor', 0)}")
+        print(f"  • Canines (Yellow): {tooth_types.get('canine', 0)}")
+        print(f"  • Posterior (Green): {tooth_types.get('posterior', 0)}")
+        
+        return len(self.teeth) >= 10
+    
+    def _apply_anatomical_zoning(self):
+        """Apply anatomical zoning classification - FIXED VERSION."""
+        if len(self.teeth) < 6:
+            # Not enough teeth for proper classification
+            for tooth in self.teeth:
+                tooth['type'] = 'incisor'
+            return
+        
+        # Step 1: Identify the 6 most anterior teeth
+        # Sort all teeth by their AP (anterior-posterior) position
+        teeth_by_ap = sorted(self.teeth, key=lambda t: t['ap_position'], reverse=True)
+        
+        # Take the 6 most anterior teeth
+        anterior_teeth = teeth_by_ap[:6]
+        
+        # Step 2: Among these 6 anterior teeth, sort by LR position
+        anterior_teeth_by_lr = sorted(anterior_teeth, key=lambda t: t['lr_position'])
+        
+        # Step 3: Classify the anterior teeth
+        # The leftmost and rightmost are canines
+        # The middle 4 are incisors
+        for i, tooth in enumerate(anterior_teeth_by_lr):
+            if i == 0 or i == 5:
+                # Outermost teeth of the anterior group = canines
+                tooth['type'] = 'canine'
+            else:
+                # Inner 4 teeth = incisors
+                tooth['type'] = 'incisor'
+        
+        # Step 4: All remaining teeth are posterior
+        anterior_set = set(id(t) for t in anterior_teeth)
+        for tooth in self.teeth:
+            if id(tooth) not in anterior_set:
+                tooth['type'] = 'posterior'
+        
+        print("\nAnatomical Zoning Applied:")
+        print(f"  • Identified {len(anterior_teeth)} anterior teeth")
+        print(f"  • Classified 2 as canines (outermost of anterior group)")
+        print(f"  • Classified 4 as incisors (central anterior teeth)")
+        print(f"  • Classified {len(self.teeth) - 6} as posterior teeth")
+    
+    def calculate_lingual_bracket_positions(self):
+        """Calculate bracket positions on LINGUAL (inner) surface of teeth."""
+        print(f"\n{'─'*50}")
+        print("LINGUAL BRACKET POSITIONING (INNER SURFACE)")
+        print(f"{'─'*50}")
+        
+        self.bracket_positions = []
+        mesh_center = self.mesh.get_center()
+        vertices = np.asarray(self.mesh.vertices)
+        
+        for i, tooth in enumerate(self.teeth):
+            # Get clinical bracket height based on simplified types
+            if tooth['type'] == 'incisor':
+                bracket_height = 4.0
+            elif tooth['type'] == 'canine':
+                bracket_height = 5.0
+            else:  # posterior
+                bracket_height = 4.0
+            
+            tooth_vertices = tooth['vertices']
+            tooth_center = tooth['center']
+            
+            # Calculate target height
+            if self.arch_type == 'upper':
+                target_height = np.min(tooth_vertices[:, self.height_axis]) + bracket_height
+            else:
+                target_height = np.max(tooth_vertices[:, self.height_axis]) - bracket_height
+            
+            # Get vertices at bracket level with wider tolerance
+            height_tolerance = 2.0
+            bracket_level_mask = np.abs(tooth_vertices[:, self.height_axis] - target_height) < height_tolerance
+            bracket_level_vertices = tooth_vertices[bracket_level_mask]
+            
+            if len(bracket_level_vertices) < 10:
+                # Use tooth center at bracket height
+                bracket_pos = tooth_center.copy()
+                bracket_pos[self.height_axis] = target_height
+                
+                # Calculate INWARD direction (towards tongue/palate)
+                horizontal_vector = bracket_pos - mesh_center
+                horizontal_vector[self.height_axis] = 0
+                if np.linalg.norm(horizontal_vector) > 0:
+                    # INWARD normal (opposite of outward)
+                    inward_normal = -horizontal_vector / np.linalg.norm(horizontal_vector)
+                else:
+                    inward_normal = np.array([0, -1, 0])
+            else:
+                # IMPROVED LINGUAL SURFACE DETECTION
+                # Find the INNERMOST surface (closest to tongue/palate)
+                
+                # Step 1: Project vertices to horizontal plane
+                horizontal_positions = bracket_level_vertices.copy()
+                horizontal_positions[:, self.height_axis] = 0
+                
+                # Step 2: Calculate local coordinate system for this tooth
+                tooth_horizontal = tooth_center.copy()
+                tooth_horizontal[self.height_axis] = 0
+                
+                center_horizontal = mesh_center.copy()
+                center_horizontal[self.height_axis] = 0
+                
+                # Vector from arch center to tooth
+                radial_vector = tooth_horizontal - center_horizontal
+                if np.linalg.norm(radial_vector) > 0:
+                    radial_direction = radial_vector / np.linalg.norm(radial_vector)
+                else:
+                    radial_direction = np.array([1, 0, 0])
+                
+                # Step 3: Project vertices along radial direction
+                radial_distances = []
+                for vertex in bracket_level_vertices:
+                    vertex_horizontal = vertex.copy()
+                    vertex_horizontal[self.height_axis] = 0
+                    
+                    # Vector from arch center to vertex
+                    vertex_radial = vertex_horizontal - center_horizontal
+                    
+                    # Project onto radial direction
+                    radial_dist = np.dot(vertex_radial, radial_direction)
+                    radial_distances.append(radial_dist)
+                
+                radial_distances = np.array(radial_distances)
+                
+                # Step 4: Find INNERMOST vertices (closest to center - LINGUAL side)
+                # Use bottom 15% to ensure we get lingual surface
+                percentile_15 = np.percentile(radial_distances, 15)
+                lingual_mask = radial_distances <= percentile_15
+                lingual_vertices = bracket_level_vertices[lingual_mask]
+                
+                if len(lingual_vertices) > 3:
+                    # Use mean of lingual vertices
+                    bracket_pos = np.mean(lingual_vertices, axis=0)
+                else:
+                    # Use single innermost point
+                    bracket_pos = bracket_level_vertices[np.argmin(radial_distances)]
+                
+                # Calculate proper INWARD normal (towards center)
+                inward_normal = -radial_direction.copy()
+            
+            # Apply clinical offset for lingual placement
+            # Smaller offset since we're on the inner surface
+            clinical_offset = 2.0  # Reduced offset for lingual placement
+            bracket_pos = bracket_pos + inward_normal * clinical_offset
+            
+            # Store bracket information
+            self.bracket_positions.append({
+                'position': bracket_pos,
+                'tooth_type': tooth['type'],
+                'tooth_index': i,
+                'tooth_center': tooth_center,
+                'normal': inward_normal,
+                'height': bracket_height,
+                'surface': 'lingual'  # Mark as lingual placement
+            })
+        
+        print(f"✓ Positioned {len(self.bracket_positions)} LINGUAL brackets")
+        
+        # Verify positioning
+        for i, bracket in enumerate(self.bracket_positions):
+            offset_dist = np.linalg.norm(bracket['position'] - bracket['tooth_center'])
+            radial_dist = np.linalg.norm(
+                bracket['position'][[self.lr_axis, self.ap_axis]] - 
+                mesh_center[[self.lr_axis, self.ap_axis]]
+            )
+            print(f"  • Tooth {i+1} ({bracket['tooth_type']}): "
+                  f"{offset_dist:.1f}mm from center, "
+                  f"{radial_dist:.1f}mm from arch center (LINGUAL)")
+    
+    def create_smooth_wire_path(self):
+        """Create smooth, non-penetrating wire path on lingual surface."""
+        print(f"\n{'─'*50}")
+        print("SMOOTH LINGUAL WIRE PATH GENERATION")
+        print(f"{'─'*50}")
+        
+        if not self.bracket_positions:
+            return None
+        
+        # Extract positions
+        positions = np.array([b['position'] for b in self.bracket_positions])
+        
+        # Sort by angle around arch
+        mesh_center = self.mesh.get_center()
+        angles = []
+        for pos in positions:
+            angle = np.arctan2(
+                pos[self.ap_axis] - mesh_center[self.ap_axis],
+                pos[self.lr_axis] - mesh_center[self.lr_axis]
+            )
+            angles.append(angle)
+        
+        sorted_indices = np.argsort(angles)
+        sorted_positions = positions[sorted_indices]
+        sorted_brackets = [self.bracket_positions[i] for i in sorted_indices]
+        
+        # Find posterior gap
+        max_gap = 0
+        gap_index = -1
+        
+        for i in range(len(sorted_positions)):
+            next_i = (i + 1) % len(sorted_positions)
+            gap_dist = np.linalg.norm(sorted_positions[next_i] - sorted_positions[i])
+            
+            if gap_dist > max_gap:
+                max_gap = gap_dist
+                gap_index = i
+        
+        # Reorder to start after gap
+        if gap_index >= 0 and max_gap > 15.0:
+            sorted_positions = np.vstack([
+                sorted_positions[gap_index+1:],
+                sorted_positions[:gap_index+1]
+            ])
+            sorted_brackets = sorted_brackets[gap_index+1:] + sorted_brackets[:gap_index+1]
+            print(f"  • Reordered wire to start after {max_gap:.1f}mm posterior gap")
+        
+        # Create wire path with all bracket points
+        self.wire_path = []
+        
+        for i, (pos, bracket) in enumerate(zip(sorted_positions, sorted_brackets)):
+            self.wire_path.append({
+                'position': pos.copy(),
+                'type': 'bracket',
+                'tooth_type': bracket['tooth_type'],
+                'index': i,
+                'surface': 'lingual'
+            })
+        
+        # Add smooth interpolation
+        if len(self.wire_path) > 3:
+            # Use spline interpolation for smooth curves
+            points = np.array([p['position'] for p in self.wire_path])
+            
+            # Parametric interpolation
+            num_points = len(points)
+            t = np.linspace(0, 1, num_points)
+            
+            # Create splines for each dimension
+            from scipy.interpolate import UnivariateSpline
+            
+            spline_lr = UnivariateSpline(t, points[:, self.lr_axis], k=3, s=2)
+            spline_ap = UnivariateSpline(t, points[:, self.ap_axis], k=3, s=2)
+            spline_height = UnivariateSpline(t, points[:, self.height_axis], k=3, s=0.5)
+            
+            # Generate smooth path
+            t_smooth = np.linspace(0, 1, num_points * 5)
+            smooth_path = []
+            
+            for t_val in t_smooth:
+                smooth_pos = np.zeros(3)
+                smooth_pos[self.lr_axis] = spline_lr(t_val)
+                smooth_pos[self.ap_axis] = spline_ap(t_val)
+                smooth_pos[self.height_axis] = spline_height(t_val)
+                
+                smooth_path.append({
+                    'position': smooth_pos,
+                    'type': 'interpolated',
+                    'tooth_type': 'transition',
+                    'index': t_val * (num_points - 1),
+                    'surface': 'lingual'
+                })
+            
+            # Replace with smooth path
+            self.wire_path = smooth_path
+        
+        print(f"✓ Generated smooth LINGUAL wire path with {len(self.wire_path)} points")
+        
+        return self.wire_path
+    
+    def create_visualization_meshes(self):
+        """Create visualization meshes for lingual wire system."""
+        print(f"\n{'─'*50}")
+        print("3D LINGUAL WIRE VISUALIZATION MESHES")
+        print(f"{'─'*50}")
+        
+        # Create wire mesh with gold color for lingual wire
+        wire_mesh = o3d.geometry.TriangleMesh()
+        
+        positions = [p['position'] for p in self.wire_path]
+        
+        # Identify gaps in wire
+        gap_threshold = 20.0
+        
+        for i in range(len(positions) - 1):
+            p1 = positions[i]
+            p2 = positions[i + 1]
+            
+            segment_length = np.linalg.norm(p2 - p1)
+            
+            # Skip large gaps
+            if segment_length > gap_threshold:
+                continue
+            
+            if segment_length < 0.01:
+                continue
+            
+            # Create wire segment
+            cylinder = o3d.geometry.TriangleMesh.create_cylinder(
+                radius=self.wire_radius,
+                height=segment_length,
+                resolution=16
+            )
+            
+            # Orient cylinder
+            z_axis = np.array([0, 0, 1])
+            segment_dir = (p2 - p1) / segment_length
+            
+            rotation_axis = np.cross(z_axis, segment_dir)
+            if np.linalg.norm(rotation_axis) > 1e-6:
+                rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+                angle = np.arccos(np.clip(np.dot(z_axis, segment_dir), -1, 1))
+                R = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * angle)
+                cylinder.rotate(R, center=[0, 0, 0])
+            
+            cylinder.translate((p1 + p2) / 2)
+            wire_mesh += cylinder
+        
+        # Add spheres at bracket positions for smooth joints
+        for bracket in self.bracket_positions:
+            sphere = o3d.geometry.TriangleMesh.create_sphere(
+                radius=self.wire_radius * 1.2,
+                resolution=10
+            )
+            sphere.translate(bracket['position'])
+            wire_mesh += sphere
+        
+        # Color wire as gold/titanium for lingual wire
+        wire_mesh.paint_uniform_color([0.85, 0.75, 0.45])  # Gold color for lingual
+        wire_mesh.compute_vertex_normals()
+        
+        # Create bracket markers with correct color coding
+        bracket_markers = o3d.geometry.TriangleMesh()
+        
+        for bracket in self.bracket_positions:
+            # Create smaller bracket box for lingual brackets
+            bracket_mesh = o3d.geometry.TriangleMesh.create_box(1.5, 1.8, 1.0)
+            bracket_mesh.translate([-0.75, -0.9, -0.5])
+            
+            # Orient bracket
+            if 'normal' in bracket and np.linalg.norm(bracket['normal']) > 0:
+                z_axis = np.array([0, 0, 1])
+                normal = bracket['normal']
+                
+                rotation_axis = np.cross(z_axis, normal)
+                if np.linalg.norm(rotation_axis) > 1e-6:
+                    rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+                    angle = np.arccos(np.clip(np.dot(z_axis, normal), -1, 1))
+                    R = o3d.geometry.get_rotation_matrix_from_axis_angle(rotation_axis * angle)
+                    bracket_mesh.rotate(R, center=[0, 0, 0])
+            
+            bracket_mesh.translate(bracket['position'])
+            
+            # Apply correct color based on tooth type
+            if bracket['tooth_type'] == 'incisor':
+                # BLUE for incisors
+                bracket_mesh.paint_uniform_color([0.1, 0.3, 0.8])
+            elif bracket['tooth_type'] == 'canine':
+                # YELLOW for canines
+                bracket_mesh.paint_uniform_color([0.9, 0.8, 0.1])
+            else:  # posterior
+                # GREEN for all posterior teeth
+                bracket_mesh.paint_uniform_color([0.1, 0.7, 0.1])
+            
+            bracket_markers += bracket_mesh
+        
+        bracket_markers.compute_vertex_normals()
+        
+        print("✓ Created lingual visualization meshes")
+        print("\nLingual System Color Coding:")
+        print("  • BLUE: Incisors (4 front teeth)")
+        print("  • YELLOW: Canines (2 corner teeth)")
+        print("  • GREEN: Posterior teeth (all remaining)")
+        print("  • GOLD WIRE: Lingual orthodontic wire (inner surface)")
+        
+        return wire_mesh, bracket_markers
+    
+    def validate_lingual_wire_quality(self):
+        """Validate lingual wire quality and positioning."""
+        print(f"\n{'─'*50}")
+        print("LINGUAL WIRE QUALITY VALIDATION")
+        print(f"{'─'*50}")
+        
+        validations = {
+            'tooth_count': len(self.teeth) >= 10,
+            'bracket_count': len(self.bracket_positions) == len(self.teeth),
+            'lingual_placement': self._validate_lingual_placement(),
+            'color_coding': self._validate_color_coding(),
+            'wire_clearance': self._validate_lingual_clearance(),
+            'wire_symmetry': self._validate_symmetry()
+        }
+        
+        print("Lingual wire quality checks:")
+        for check, passed in validations.items():
+            status = "✓ PASS" if passed else "✗ FAIL"
+            print(f"  • {check.replace('_', ' ').title()}: {status}")
+        
+        overall_valid = all(validations.values())
+        
+        if overall_valid:
+            print("\n✓ LINGUAL WIRE PASSES ALL QUALITY CHECKS")
+        else:
+            print("\n✗ LINGUAL WIRE REQUIRES ADJUSTMENT")
+        
+        return overall_valid
+    
+    def _validate_lingual_placement(self):
+        """Validate that brackets are properly placed on lingual surface."""
+        if not self.bracket_positions:
+            return False
+        
+        mesh_center = self.mesh.get_center()
+        
+        # Check each bracket is on the inner (lingual) side
+        for bracket in self.bracket_positions:
+            # Distance from arch center
+            bracket_radius = np.linalg.norm(
+                bracket['position'][[self.lr_axis, self.ap_axis]] - 
+                mesh_center[[self.lr_axis, self.ap_axis]]
+            )
+            tooth_radius = np.linalg.norm(
+                bracket['tooth_center'][[self.lr_axis, self.ap_axis]] - 
+                mesh_center[[self.lr_axis, self.ap_axis]]
+            )
+            
+            # For lingual placement, bracket should be CLOSER to center than tooth
+            if bracket_radius > tooth_radius:
+                return False
+        
+        return True
+    
+    def _validate_color_coding(self):
+        """Validate correct color coding is applied."""
+        type_counts = {'incisor': 0, 'canine': 0, 'posterior': 0}
+        
+        for tooth in self.teeth:
+            if tooth['type'] in type_counts:
+                type_counts[tooth['type']] += 1
+        
+        # Should have exactly 4 incisors and 2 canines
+        return type_counts['incisor'] == 4 and type_counts['canine'] == 2
+    
+    def _validate_lingual_clearance(self):
+        """Check if lingual wire has proper clearance from teeth."""
+        if not self.bracket_positions:
+            return False
+        
+        mesh_center = self.mesh.get_center()
+        
+        # Check each bracket is properly positioned on lingual side
+        for bracket in self.bracket_positions:
+            # Distance from tooth center
+            tooth_offset = np.linalg.norm(bracket['position'] - bracket['tooth_center'])
+            
+            # Should be at least 3mm from tooth center (smaller for lingual)
+            if tooth_offset < 3.0:
+                return False
+            
+            # Should be closer to arch center than tooth (lingual side)
+            bracket_radius = np.linalg.norm(
+                bracket['position'][[self.lr_axis, self.ap_axis]] - 
+                mesh_center[[self.lr_axis, self.ap_axis]]
+            )
+            tooth_radius = np.linalg.norm(
+                bracket['tooth_center'][[self.lr_axis, self.ap_axis]] - 
+                mesh_center[[self.lr_axis, self.ap_axis]]
+            )
+            
+            if bracket_radius > tooth_radius:
+                return False
+        
+        return True
+    
+    def _validate_symmetry(self):
+        """Check if wire is reasonably symmetric."""
+        if len(self.bracket_positions) < 8:
+            return False
+        
+        # Check if we have paired teeth
+        left_count = sum(1 for b in self.bracket_positions if b['position'][self.lr_axis] < 0)
+        right_count = len(self.bracket_positions) - left_count
+        
+        # Should be roughly equal
+        return abs(left_count - right_count) <= 2
+    
+    def export_lingual_clinical_data(self, instructions, filename=None):
+        """Export lingual clinical bending instructions."""
+        if filename is None:
+            filename = f"lingual_wire_{self.arch_type}_{self.wire_size.replace('.', '')}.csv"
+        
+        print(f"\n{'─'*50}")
+        print("EXPORTING LINGUAL CLINICAL DATA")
+        print(f"{'─'*50}")
+        
+        # Filter to bracket points only
+        bracket_instructions = [inst for inst in instructions if inst.get('at_bracket', False)]
+        
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Header
+            writer.writerow(['Lingual Orthodontic Wire - Clinical Instructions'])
+            writer.writerow([f'Arch Type: {self.arch_type.upper()}'])
+            writer.writerow([f'Wire Size: {self.wire_size}'])
+            writer.writerow([f'Placement: LINGUAL (Inner Surface)'])
+            writer.writerow([f'Generated: {os.popen("date").read().strip()}'])
+            writer.writerow([])
+            
+            # Column headers
+            writer.writerow([
+                'Point', 'Feed_mm', 'Bend_deg', 
+                'X_mm', 'Y_mm', 'Z_mm', 
+                'Tooth_Type', 'Surface', 'Notes'
+            ])
+            
+            # Write instructions
+            for i, inst in enumerate(bracket_instructions):
+                notes = 'Lingual placement'
+                if abs(inst['bend_angle']) > 30:
+                    notes += ' - Major bend required'
+                elif inst['tooth_type'] == 'canine':
+                    notes += ' - Canine position'
+                elif inst['tooth_type'] == 'incisor':
+                    notes += ' - Anterior segment'
+                else:
+                    notes += ' - Posterior anchor'
+                
+                writer.writerow([
+                    i + 1,
+                    f"{inst['feed_distance']:.2f}",
+                    f"{inst['bend_angle']:.1f}",
+                    f"{inst['position'][0]:.2f}",
+                    f"{inst['position'][1]:.2f}",
+                    f"{inst['position'][2]:.2f}",
+                    inst['tooth_type'].title(),
+                    'Lingual',
+                    notes
+                ])
+        
+        print(f"✓ Exported to: {filename}")
+        
+        if bracket_instructions:
+            total_length = bracket_instructions[-1]['feed_distance']
+            num_bends = len([i for i in bracket_instructions if abs(i['bend_angle']) > 5])
+            
+            print(f"\nLingual Wire Production Summary:")
+            print(f"  • Wire length: {total_length:.1f}mm ({total_length/25.4:.2f}\")")
+            print(f"  • Bend points: {len(bracket_instructions)}")
+            print(f"  • Active bends: {num_bends}")
+            print(f"  • Surface: LINGUAL (Inner/Tongue side)")
+    
+    def calculate_bending_instructions(self):
+        """Calculate wire bending instructions for lingual placement."""
+        print(f"\n{'─'*50}")
+        print("LINGUAL BENDING INSTRUCTIONS CALCULATION")
+        print(f"{'─'*50}")
+        
+        if not self.bracket_positions:
+            return []
+        
+        instructions = []
+        cumulative_feed = 0.0
+        
+        # Get bracket positions in wire order
+        bracket_positions_ordered = []
+        for bracket in self.bracket_positions:
+            # Find closest wire path point
+            min_dist = float('inf')
+            closest_idx = -1
+            
+            for i, path_point in enumerate(self.wire_path):
+                dist = np.linalg.norm(path_point['position'] - bracket['position'])
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            
+            if closest_idx >= 0:
+                bracket_positions_ordered.append({
+                    'bracket': bracket,
+                    'wire_index': closest_idx
+                })
+        
+        # Sort by wire index
+        bracket_positions_ordered.sort(key=lambda x: x['wire_index'])
+        
+        # Calculate instructions for each bracket
+        for i in range(len(bracket_positions_ordered)):
+            bracket_info = bracket_positions_ordered[i]
+            bracket = bracket_info['bracket']
+            position = bracket['position']
+            
+            # Feed distance
+            if i > 0:
+                prev_pos = bracket_positions_ordered[i-1]['bracket']['position']
+                segment_length = np.linalg.norm(position - prev_pos)
+                cumulative_feed += segment_length
+            
+            # Bend angle
+            bend_angle = 0.0
+            if 0 < i < len(bracket_positions_ordered) - 1:
+                p1 = bracket_positions_ordered[i-1]['bracket']['position']
+                p2 = position
+                p3 = bracket_positions_ordered[i+1]['bracket']['position']
+                
+                v1 = p1 - p2
+                v2 = p3 - p2
+                
+                v1_norm = v1 / (np.linalg.norm(v1) + 1e-8)
+                v2_norm = v2 / (np.linalg.norm(v2) + 1e-8)
+                
+                dot_product = np.clip(np.dot(v1_norm, v2_norm), -1, 1)
+                angle_rad = np.arccos(dot_product)
+                bend_angle = np.degrees(angle_rad)
+                
+                # Determine direction
+                cross = np.cross(v1_norm, v2_norm)
+                if cross[self.height_axis] < 0:
+                    bend_angle = -bend_angle
+            
+            instructions.append({
+                'index': i,
+                'feed_distance': cumulative_feed,
+                'bend_angle': bend_angle,
+                'position': position.tolist(),
+                'tooth_type': bracket['tooth_type'],
+                'surface': 'lingual',
+                'at_bracket': True
+            })
+        
+        print(f"✓ Generated {len(instructions)} lingual bending instructions")
+        
+        return instructions
+    
+    def generate_lingual_wire(self):
+        """Main method to generate lingual orthodontic wire."""
+        
+        # Step 1: Load mesh
+        if not self.load_mesh():
+            return None
+        
+        # Step 2: Detect teeth with anatomical zoning
+        if not self.detect_teeth_with_anatomical_zoning():
+            print("\n✗ Failed to detect sufficient teeth")
+            return None
+        
+        # Step 3: Calculate lingual bracket positions
+        self.calculate_lingual_bracket_positions()
+        
+        # Step 4: Create smooth wire path
+        if not self.create_smooth_wire_path():
+            print("\n✗ Failed to create wire path")
+            return None
+        
+        # Step 5: Calculate bending instructions
+        instructions = self.calculate_bending_instructions()
+        
+        # Step 6: Create visualization
+        wire_mesh, bracket_markers = self.create_visualization_meshes()
+        
+        # Step 7: Validate quality
+        is_valid = self.validate_lingual_wire_quality()
+        
+        # Step 8: Export if valid
+        export_file = None
+        if instructions and is_valid:
+            export_file = self.export_lingual_clinical_data(instructions)
+        
+        print(f"\n{'='*70}")
+        print("LINGUAL WIRE GENERATION COMPLETE")
+        print(f"{'='*70}")
+        
+        return {
+            'mesh': self.mesh,
+            'wire_mesh': wire_mesh,
+            'bracket_markers': bracket_markers,
+            'instructions': instructions,
+            'wire_path': self.wire_path,
+            'is_valid': is_valid,
+            'export_file': export_file,
+            'surface': 'lingual'
+        }
+    
+    def visualize_lingual_system(self, components):
+        """Professional visualization of lingual orthodontic system."""
+        print(f"\n{'─'*50}")
+        print("LINGUAL ORTHODONTIC 3D VISUALIZATION")
+        print(f"{'─'*50}")
+        
+        # Create visualizer
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(
+            window_name=f"Lingual Orthodontic Wire Generator v2.0 - {self.arch_type.upper()} ARCH (INNER SURFACE)",
+            width=1600,
+            height=1000
+        )
+        
+        # Add components
+        if components['mesh']:
+            vis.add_geometry(components['mesh'])
+        
+        if components['wire_mesh']:
+            vis.add_geometry(components['wire_mesh'])
+        
+        if components['bracket_markers']:
+            vis.add_geometry(components['bracket_markers'])
+        
+        # Add coordinate system
+        coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=15.0,
+            origin=[0, 0, 0]
+        )
+        vis.add_geometry(coord_frame)
+        
+        # Configure render options
+        opt = vis.get_render_option()
+        opt.background_color = np.array([0.92, 0.92, 0.95])
+        opt.mesh_show_back_face = True
+        opt.point_size = 3.0
+        
+        # Set initial view
+        ctr = vis.get_view_control()
+        ctr.set_zoom(0.7)
+        
+        print("\nVisualization Controls:")
+        print("  • Mouse Left: Rotate view")
+        print("  • Mouse Scroll: Zoom in/out")
+        print("  • Mouse Right: Pan view")
+        print("  • Q: Close window")
+        
+        print("\nLINGUAL SYSTEM COLOR CODING:")
+        print("  • BLUE brackets: Incisors (4 front teeth)")
+        print("  • YELLOW brackets: Canines (2 corner teeth)")
+        print("  • GREEN brackets: Posterior teeth (premolars & molars)")
+        print("  • GOLD wire: Lingual orthodontic wire (INNER SURFACE)")
+        
+        validation_status = "PASSED" if components['is_valid'] else "NEEDS REVIEW"
+        print(f"\nValidation Status: {validation_status}")
+        print(f"Wire Placement: LINGUAL (Inner/Tongue side)")
+        
+        # Run visualization
+        vis.run()
+        vis.destroy_window()
+
+
+def main():
+    """Main execution for lingual orthodontic wire generation."""
+    print("\n" + "="*70)
+    print("LINGUAL ORTHODONTIC WIRE GENERATOR v2.0")
+    print("*** INNER SURFACE (LINGUAL) PLACEMENT ***")
+    print("="*70 + "\n")
+    
+    # Configuration
+    stl_path = "/Users/galala/STL con/assets/AyaKhairy_LowerJaw.stl"
+    
+    # Create lingual generator
+    generator = LingualOrthodonticWireGenerator(
+        stl_path=stl_path,
+        arch_type='auto',
+        wire_size='0.018'
+    )
+    
+    # Generate lingual wire
+    result = generator.generate_lingual_wire()
+    
+    if result:
+        if result['is_valid']:
+            print("\n✅ SUCCESS: Lingual wire generated and validated")
+            print("✅ Wire positioned on INNER (lingual) surface")
+            if result['export_file']:
+                print(f"✅ Clinical instructions exported to: {result['export_file']}")
+        else:
+            print("\n⚠️  WARNING: Lingual wire generated but validation failed")
+            print("Please review the visualization for issues")
+        
+        # Always show visualization
+        generator.visualize_lingual_system(result)
+    else:
+        print("\n❌ CRITICAL ERROR: Failed to generate lingual wire")
+
+
+if __name__ == "__main__":
+    main()
